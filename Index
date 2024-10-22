@@ -1,0 +1,244 @@
+npm install -g vercel
+/your-project
+    /api
+        index.py
+    requirements.txt
+    vercel.json
+git init
+
+# vercel.json
+{
+    "version": 2,
+    "builds": [
+        {
+            "src": "api/index.py",
+            "use": "@vercel/python"
+        }
+    ],
+    "routes": [
+        {
+            "src": "/(.*)",
+            "dest": "api/index.py"
+        }
+    ],
+    "env": {
+        "HUBSPOT_API_KEY": "your-hubspot-api-key",
+        "SMTP_EMAIL": "your-email@example.com",
+        "SMTP_PASSWORD": "your-email-password"
+    }
+}
+
+# requirements.txt
+flask==2.0.1
+flask-sqlalchemy==2.5.1
+requests==2.26.0
+python-dotenv==0.19.0
+aiosqlite==0.17.0
+
+# api/index.py
+from flask import Flask, request, jsonify
+from flask_sqlalchemy import SQLAlchemy
+import os
+from datetime import datetime
+import requests
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+import smtplib
+from decimal import Decimal, ROUND_HALF_UP
+from http import HTTPStatus
+
+app = Flask(__name__)
+
+# Configure SQLite to use aiosqlite for better serverless performance
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///invoices.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# Load environment variables
+HUBSPOT_API_KEY = os.environ.get('HUBSPOT_API_KEY')
+SMTP_EMAIL = os.environ.get('SMTP_EMAIL')
+SMTP_PASSWORD = os.environ.get('SMTP_PASSWORD')
+
+# Constants
+HUBSPOT_API_URL = "https://api.hubapi.com/crm/v3/objects/contacts"
+ALLOWED_SPOOL_TYPES = {
+    "33lb": 33.0,
+    "44lb": 44.0,
+    "550lb": 550.0
+}
+
+db = SQLAlchemy(app)
+
+# Models
+class Invoice(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    client_email = db.Column(db.String(120), nullable=False)
+    client_name = db.Column(db.String(120), nullable=False)
+    spool_type = db.Column(db.String(50), nullable=False)
+    price_per_pound = db.Column(db.Float, nullable=False)
+    spool_weight = db.Column(db.Float, nullable=False)
+    quantity = db.Column(db.Integer, nullable=False)
+    total_price = db.Column(db.Float, nullable=False)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'created_at': self.created_at.isoformat(),
+            'client_email': self.client_email,
+            'client_name': self.client_name,
+            'spool_type': self.spool_type,
+            'price_per_pound': self.price_per_pound,
+            'spool_weight': self.spool_weight,
+            'quantity': self.quantity,
+            'total_price': self.total_price
+        }
+
+# Initialize database
+with app.app_context():
+    db.create_all()
+
+# Utility functions
+def get_client_info(email):
+    headers = {
+        "Authorization": f"Bearer {HUBSPOT_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    params = {
+        "filterGroups": [{
+            "filters": [{
+                "propertyName": "email",
+                "operator": "EQ",
+                "value": email
+            }]
+        }]
+    }
+    
+    try:
+        response = requests.post(
+            f"{HUBSPOT_API_URL}/search",
+            headers=headers,
+            json=params
+        )
+        response.raise_for_status()
+        data = response.json()
+        
+        if data.get('total') > 0:
+            properties = data['results'][0]['properties']
+            return {
+                'email': properties.get('email'),
+                'name': f"{properties.get('firstname', '')} {properties.get('lastname', '')}".strip()
+            }
+        return None
+        
+    except requests.exceptions.RequestException:
+        return None
+
+def send_invoice_email(invoice_data):
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = SMTP_EMAIL
+        msg['To'] = invoice_data['client_email']
+        msg['Subject'] = f"Invoice #{invoice_data['id']} for Welding Wire Spools"
+        
+        body = f"""
+Dear {invoice_data['client_name']},
+
+Here is your invoice details:
+
+Invoice Number: {invoice_data['id']}
+Spool Type: {invoice_data['spool_type']}
+Quantity: {invoice_data['quantity']}
+Price per Pound: ${invoice_data['price_per_pound']:.2f}
+Total Weight: {invoice_data['spool_weight'] * invoice_data['quantity']:.2f} lbs
+Total Amount: ${invoice_data['total_price']:.2f}
+
+Thank you for your business!
+
+Best regards,
+Your Company Name
+"""
+        msg.attach(MIMEText(body, 'plain'))
+        
+        with smtplib.SMTP('smtp.gmail.com', 587) as server:
+            server.starttls()
+            server.login(SMTP_EMAIL, SMTP_PASSWORD)
+            server.send_message(msg)
+        
+        return True
+        
+    except Exception:
+        return False
+
+# Routes
+@app.route('/api/invoices', methods=['POST'])
+def create_invoice():
+    try:
+        data = request.get_json()
+        
+        # Validate required fields
+        required_fields = ['email', 'spool_type', 'price_per_pound', 'quantity']
+        if not all(field in data for field in required_fields):
+            return jsonify({'error': 'Missing required fields'}), HTTPStatus.BAD_REQUEST
+            
+        # Validate spool type
+        if data['spool_type'] not in ALLOWED_SPOOL_TYPES:
+            return jsonify({'error': 'Invalid spool type'}), HTTPStatus.BAD_REQUEST
+            
+        # Validate numeric values
+        try:
+            price_per_pound = float(Decimal(str(data['price_per_pound'])).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+            quantity = int(data['quantity'])
+            if price_per_pound <= 0 or quantity <= 0:
+                raise ValueError
+        except (ValueError, decimal.InvalidOperation):
+            return jsonify({'error': 'Invalid numeric values'}), HTTPStatus.BAD_REQUEST
+            
+        # Get client info from HubSpot
+        client_info = get_client_info(data['email'])
+        if not client_info:
+            return jsonify({'error': 'Client not found in HubSpot'}), HTTPStatus.NOT_FOUND
+            
+        # Calculate total price
+        spool_weight = ALLOWED_SPOOL_TYPES[data['spool_type']]
+        total_price = float(Decimal(str(price_per_pound * spool_weight * quantity)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+        
+        # Create invoice
+        invoice = Invoice(
+            client_email=client_info['email'],
+            client_name=client_info['name'],
+            spool_type=data['spool_type'],
+            price_per_pound=price_per_pound,
+            spool_weight=spool_weight,
+            quantity=quantity,
+            total_price=total_price
+        )
+        
+        db.session.add(invoice)
+        db.session.commit()
+        
+        # Send email
+        invoice_data = invoice.to_dict()
+        email_sent = send_invoice_email(invoice_data)
+        
+        response_data = {
+            'message': 'Invoice created successfully',
+            'invoice': invoice_data,
+            'email_sent': email_sent
+        }
+        
+        return jsonify(response_data), HTTPStatus.CREATED
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': 'Internal server error'}), HTTPStatus.INTERNAL_SERVER_ERROR
+
+@app.route('/api/invoices/<int:invoice_id>', methods=['GET'])
+def get_invoice(invoice_id):
+    invoice = Invoice.query.get_or_404(invoice_id)
+    return jsonify(invoice.to_dict())
+
+# Health check endpoint for Vercel
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    return jsonify({'status': 'healthy'}), 200
