@@ -1,0 +1,245 @@
+// src/types/invoice.ts
+export interface InvoiceData {
+  clientName: string;
+  clientEmail: string;
+  spoolType: "33lb" | "44lb" | "550lb";
+  pricePerPound: number;
+  quantity: number;
+}
+
+export interface Invoice extends InvoiceData {
+  id: string;
+  createdAt: Date;
+  spoolWeight: number;
+  totalPrice: number;
+}
+
+// pages/api/invoices/index.ts
+import { NextApiRequest, NextApiResponse } from 'next';
+import { InvoiceData } from '@/types/invoice';
+
+const SPOOL_WEIGHTS = {
+  "33lb": 33.0,
+  "44lb": 44.0,
+  "550lb": 550.0,
+} as const;
+
+// Simple in-memory storage (replace with database in production)
+let invoices: any[] = [];
+
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse
+) {
+  if (req.method === 'POST') {
+    try {
+      const data = req.body as InvoiceData;
+
+      // Validate input
+      if (!data.clientEmail || !data.clientName || !data.spoolType || !data.pricePerPound || !data.quantity) {
+        return res.status(400).json({ error: 'Missing required fields' });
+      }
+
+      if (!SPOOL_WEIGHTS[data.spoolType]) {
+        return res.status(400).json({ error: 'Invalid spool type' });
+      }
+
+      // Calculate total price
+      const spoolWeight = SPOOL_WEIGHTS[data.spoolType];
+      const totalPrice = Number((data.pricePerPound * spoolWeight * data.quantity).toFixed(2));
+
+      // Create invoice
+      const invoice = {
+        id: Date.now().toString(),
+        createdAt: new Date(),
+        clientEmail: data.clientEmail,
+        clientName: data.clientName,
+        spoolType: data.spoolType,
+        pricePerPound: data.pricePerPound,
+        spoolWeight,
+        quantity: data.quantity,
+        totalPrice,
+      };
+
+      // Store invoice in memory
+      invoices.push(invoice);
+
+      return res.status(201).json({
+        message: 'Invoice created successfully',
+        invoice,
+      });
+
+    } catch (error) {
+      console.error('Error creating invoice:', error);
+      return res.status(500).json({ error: 'Internal server error' });
+    }
+  } else if (req.method === 'GET') {
+    return res.status(200).json(invoices);
+  }
+
+  return res.status(405).json({ error: 'Method not allowed' });
+}
+
+// pages/api/invoices/[id].ts
+import { NextApiRequest, NextApiResponse } from 'next';
+
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse
+) {
+  if (req.method !== 'GET') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  const { id } = req.query;
+  const invoice = invoices.find(inv => inv.id === id);
+
+  if (!invoice) {
+    return res.status(404).json({ error: 'Invoice not found' });
+  }
+
+  return res.status(200).json(invoice);
+}
+
+// pages/index.tsx
+import { useState } from 'react';
+import { useForm } from 'react-hook-form';
+import axios from 'axios';
+import { InvoiceData, Invoice } from '@/types/invoice';
+
+export default function Home() {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<Invoice | null>(null);
+  
+  const { register, handleSubmit, formState: { errors }, reset } = useForm<InvoiceData>();
+
+  const onSubmit = async (data: InvoiceData) => {
+    setLoading(true);
+    setError(null);
+    setSuccess(null);
+
+    try {
+      const response = await axios.post('/api/invoices', data);
+      setSuccess(response.data.invoice);
+      reset();
+    } catch (err: any) {
+      setError(err.response?.data?.error || 'An error occurred');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-gray-100 py-12 px-4 sm:px-6 lg:px-8">
+      <div className="max-w-md mx-auto bg-white rounded-lg shadow-md p-6">
+        <h1 className="text-2xl font-bold mb-6">Create Invoice</h1>
+        
+        <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700">
+              Client Name
+            </label>
+            <input
+              type="text"
+              {...register('clientName', { required: 'Name is required' })}
+              className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2"
+            />
+            {errors.clientName && (
+              <p className="text-red-500 text-sm">{errors.clientName.message}</p>
+            )}
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700">
+              Client Email
+            </label>
+            <input
+              type="email"
+              {...register('clientEmail', { required: 'Email is required' })}
+              className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2"
+            />
+            {errors.clientEmail && (
+              <p className="text-red-500 text-sm">{errors.clientEmail.message}</p>
+            )}
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700">
+              Spool Type
+            </label>
+            <select
+              {...register('spoolType', { required: 'Spool type is required' })}
+              className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2"
+            >
+              <option value="">Select a spool type</option>
+              <option value="33lb">33lb</option>
+              <option value="44lb">44lb</option>
+              <option value="550lb">550lb</option>
+            </select>
+            {errors.spoolType && (
+              <p className="text-red-500 text-sm">{errors.spoolType.message}</p>
+            )}
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700">
+              Price per Pound ($)
+            </label>
+            <input
+              type="number"
+              step="0.01"
+              {...register('pricePerPound', { 
+                required: 'Price is required',
+                min: { value: 0.01, message: 'Price must be greater than 0' }
+              })}
+              className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2"
+            />
+            {errors.pricePerPound && (
+              <p className="text-red-500 text-sm">{errors.pricePerPound.message}</p>
+            )}
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700">
+              Quantity
+            </label>
+            <input
+              type="number"
+              {...register('quantity', { 
+                required: 'Quantity is required',
+                min: { value: 1, message: 'Quantity must be at least 1' }
+              })}
+              className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2"
+            />
+            {errors.quantity && (
+              <p className="text-red-500 text-sm">{errors.quantity.message}</p>
+            )}
+          </div>
+
+          <button
+            type="submit"
+            disabled={loading}
+            className="w-full bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 disabled:opacity-50"
+          >
+            {loading ? 'Creating Invoice...' : 'Create Invoice'}
+          </button>
+        </form>
+
+        {error && (
+          <div className="mt-4 p-3 bg-red-100 text-red-700 rounded-md">
+            {error}
+          </div>
+        )}
+
+        {success && (
+          <div className="mt-4 p-3 bg-green-100 text-green-700 rounded-md">
+            <h2 className="font-bold">Invoice Created Successfully</h2>
+            <p>Invoice ID: {success.id}</p>
+            <p>Total Amount: ${success.totalPrice.toFixed(2)}</p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
