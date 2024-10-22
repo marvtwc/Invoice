@@ -1,244 +1,391 @@
-npm install -g vercel
-/your-project
-    /api
-        index.py
-    requirements.txt
-    vercel.json
-git init
-
-# vercel.json
+// package.json
 {
-    "version": 2,
-    "builds": [
-        {
-            "src": "api/index.py",
-            "use": "@vercel/python"
-        }
-    ],
-    "routes": [
-        {
-            "src": "/(.*)",
-            "dest": "api/index.py"
-        }
-    ],
-    "env": {
-        "HUBSPOT_API_KEY": "your-hubspot-api-key",
-        "SMTP_EMAIL": "your-email@example.com",
-        "SMTP_PASSWORD": "your-email-password"
-    }
+  "name": "nextjs-invoice-system",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "postinstall": "prisma generate"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.0.0",
+    "@types/node": "^20.0.0",
+    "@types/react": "^18.0.0",
+    "@types/react-dom": "^18.0.0",
+    "axios": "^1.6.0",
+    "next": "13.5.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-hook-form": "^7.0.0",
+    "typescript": "^5.0.0"
+  },
+  "devDependencies": {
+    "prisma": "^5.0.0",
+    "autoprefixer": "^10.0.0",
+    "postcss": "^8.0.0",
+    "tailwindcss": "^3.0.0"
+  }
 }
 
-# requirements.txt
-flask==2.0.1
-flask-sqlalchemy==2.5.1
-requests==2.26.0
-python-dotenv==0.19.0
-aiosqlite==0.17.0
-
-# api/index.py
-from flask import Flask, request, jsonify
-from flask_sqlalchemy import SQLAlchemy
-import os
-from datetime import datetime
-import requests
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-import smtplib
-from decimal import Decimal, ROUND_HALF_UP
-from http import HTTPStatus
-
-app = Flask(__name__)
-
-# Configure SQLite to use aiosqlite for better serverless performance
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///invoices.db'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-
-# Load environment variables
-HUBSPOT_API_KEY = os.environ.get('HUBSPOT_API_KEY')
-SMTP_EMAIL = os.environ.get('SMTP_EMAIL')
-SMTP_PASSWORD = os.environ.get('SMTP_PASSWORD')
-
-# Constants
-HUBSPOT_API_URL = "https://api.hubapi.com/crm/v3/objects/contacts"
-ALLOWED_SPOOL_TYPES = {
-    "33lb": 33.0,
-    "44lb": 44.0,
-    "550lb": 550.0
+// prisma/schema.prisma
+generator client {
+  provider = "prisma-client-js"
 }
 
-db = SQLAlchemy(app)
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
 
-# Models
-class Invoice(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    client_email = db.Column(db.String(120), nullable=False)
-    client_name = db.Column(db.String(120), nullable=False)
-    spool_type = db.Column(db.String(50), nullable=False)
-    price_per_pound = db.Column(db.Float, nullable=False)
-    spool_weight = db.Column(db.Float, nullable=False)
-    quantity = db.Column(db.Integer, nullable=False)
-    total_price = db.Column(db.Float, nullable=False)
+model Invoice {
+  id            String   @id @default(cuid())
+  createdAt     DateTime @default(now())
+  clientEmail   String
+  clientName    String
+  spoolType     String
+  pricePerPound Float
+  spoolWeight   Float
+  quantity      Int
+  totalPrice    Float
+}
 
-    def to_dict(self):
-        return {
-            'id': self.id,
-            'created_at': self.created_at.isoformat(),
-            'client_email': self.client_email,
-            'client_name': self.client_name,
-            'spool_type': self.spool_type,
-            'price_per_pound': self.price_per_pound,
-            'spool_weight': self.spool_weight,
-            'quantity': self.quantity,
-            'total_price': self.total_price
-        }
+// src/types/invoice.ts
+export interface InvoiceData {
+  clientEmail: string;
+  spoolType: "33lb" | "44lb" | "550lb";
+  pricePerPound: number;
+  quantity: number;
+}
 
-# Initialize database
-with app.app_context():
-    db.create_all()
+export interface Invoice extends InvoiceData {
+  id: string;
+  createdAt: Date;
+  clientName: string;
+  spoolWeight: number;
+  totalPrice: number;
+}
 
-# Utility functions
-def get_client_info(email):
-    headers = {
-        "Authorization": f"Bearer {HUBSPOT_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    
-    params = {
-        "filterGroups": [{
-            "filters": [{
-                "propertyName": "email",
-                "operator": "EQ",
-                "value": email
-            }]
+// src/lib/hubspot.ts
+import axios from 'axios';
+
+const HUBSPOT_API_URL = "https://api.hubapi.com/crm/v3/objects/contacts";
+
+export async function getClientInfo(email: string) {
+  try {
+    const response = await axios.post(
+      `${HUBSPOT_API_URL}/search`,
+      {
+        filterGroups: [{
+          filters: [{
+            propertyName: "email",
+            operator: "EQ",
+            value: email
+          }]
         }]
-    }
-    
-    try:
-        response = requests.post(
-            f"{HUBSPOT_API_URL}/search",
-            headers=headers,
-            json=params
-        )
-        response.raise_for_status()
-        data = response.json()
-        
-        if data.get('total') > 0:
-            properties = data['results'][0]['properties']
-            return {
-                'email': properties.get('email'),
-                'name': f"{properties.get('firstname', '')} {properties.get('lastname', '')}".strip()
-            }
-        return None
-        
-    except requests.exceptions.RequestException:
-        return None
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.HUBSPOT_API_KEY}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
 
-def send_invoice_email(invoice_data):
-    try:
-        msg = MIMEMultipart()
-        msg['From'] = SMTP_EMAIL
-        msg['To'] = invoice_data['client_email']
-        msg['Subject'] = f"Invoice #{invoice_data['id']} for Welding Wire Spools"
-        
-        body = f"""
-Dear {invoice_data['client_name']},
+    const data = response.data;
+    if (data.total > 0) {
+      const properties = data.results[0].properties;
+      return {
+        email: properties.email,
+        name: `${properties.firstname || ''} ${properties.lastname || ''}`.trim()
+      };
+    }
+    return null;
+  } catch (error) {
+    console.error('HubSpot API error:', error);
+    return null;
+  }
+}
+
+// src/lib/email.ts
+import nodemailer from 'nodemailer';
+import { Invoice } from '@/types/invoice';
+
+export async function sendInvoiceEmail(invoice: Invoice) {
+  const transporter = nodemailer.createTransport({
+    host: 'smtp.gmail.com',
+    port: 587,
+    secure: false,
+    auth: {
+      user: process.env.SMTP_EMAIL,
+      pass: process.env.SMTP_PASSWORD,
+    },
+  });
+
+  const mailOptions = {
+    from: process.env.SMTP_EMAIL,
+    to: invoice.clientEmail,
+    subject: `Invoice #${invoice.id} for Welding Wire Spools`,
+    text: `
+Dear ${invoice.clientName},
 
 Here is your invoice details:
 
-Invoice Number: {invoice_data['id']}
-Spool Type: {invoice_data['spool_type']}
-Quantity: {invoice_data['quantity']}
-Price per Pound: ${invoice_data['price_per_pound']:.2f}
-Total Weight: {invoice_data['spool_weight'] * invoice_data['quantity']:.2f} lbs
-Total Amount: ${invoice_data['total_price']:.2f}
+Invoice Number: ${invoice.id}
+Spool Type: ${invoice.spoolType}
+Quantity: ${invoice.quantity}
+Price per Pound: $${invoice.pricePerPound.toFixed(2)}
+Total Weight: ${(invoice.spoolWeight * invoice.quantity).toFixed(2)} lbs
+Total Amount: $${invoice.totalPrice.toFixed(2)}
 
 Thank you for your business!
 
 Best regards,
 Your Company Name
-"""
-        msg.attach(MIMEText(body, 'plain'))
-        
-        with smtplib.SMTP('smtp.gmail.com', 587) as server:
-            server.starttls()
-            server.login(SMTP_EMAIL, SMTP_PASSWORD)
-            server.send_message(msg)
-        
-        return True
-        
-    except Exception:
-        return False
+    `,
+  };
 
-# Routes
-@app.route('/api/invoices', methods=['POST'])
-def create_invoice():
-    try:
-        data = request.get_json()
-        
-        # Validate required fields
-        required_fields = ['email', 'spool_type', 'price_per_pound', 'quantity']
-        if not all(field in data for field in required_fields):
-            return jsonify({'error': 'Missing required fields'}), HTTPStatus.BAD_REQUEST
-            
-        # Validate spool type
-        if data['spool_type'] not in ALLOWED_SPOOL_TYPES:
-            return jsonify({'error': 'Invalid spool type'}), HTTPStatus.BAD_REQUEST
-            
-        # Validate numeric values
-        try:
-            price_per_pound = float(Decimal(str(data['price_per_pound'])).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
-            quantity = int(data['quantity'])
-            if price_per_pound <= 0 or quantity <= 0:
-                raise ValueError
-        except (ValueError, decimal.InvalidOperation):
-            return jsonify({'error': 'Invalid numeric values'}), HTTPStatus.BAD_REQUEST
-            
-        # Get client info from HubSpot
-        client_info = get_client_info(data['email'])
-        if not client_info:
-            return jsonify({'error': 'Client not found in HubSpot'}), HTTPStatus.NOT_FOUND
-            
-        # Calculate total price
-        spool_weight = ALLOWED_SPOOL_TYPES[data['spool_type']]
-        total_price = float(Decimal(str(price_per_pound * spool_weight * quantity)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
-        
-        # Create invoice
-        invoice = Invoice(
-            client_email=client_info['email'],
-            client_name=client_info['name'],
-            spool_type=data['spool_type'],
-            price_per_pound=price_per_pound,
-            spool_weight=spool_weight,
-            quantity=quantity,
-            total_price=total_price
-        )
-        
-        db.session.add(invoice)
-        db.session.commit()
-        
-        # Send email
-        invoice_data = invoice.to_dict()
-        email_sent = send_invoice_email(invoice_data)
-        
-        response_data = {
-            'message': 'Invoice created successfully',
-            'invoice': invoice_data,
-            'email_sent': email_sent
-        }
-        
-        return jsonify(response_data), HTTPStatus.CREATED
-        
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({'error': 'Internal server error'}), HTTPStatus.INTERNAL_SERVER_ERROR
+  try {
+    await transporter.sendMail(mailOptions);
+    return true;
+  } catch (error) {
+    console.error('Email sending error:', error);
+    return false;
+  }
+}
 
-@app.route('/api/invoices/<int:invoice_id>', methods=['GET'])
-def get_invoice(invoice_id):
-    invoice = Invoice.query.get_or_404(invoice_id)
-    return jsonify(invoice.to_dict())
+// pages/api/invoices/index.ts
+import { NextApiRequest, NextApiResponse } from 'next';
+import { PrismaClient } from '@prisma/client';
+import { getClientInfo } from '@/lib/hubspot';
+import { sendInvoiceEmail } from '@/lib/email';
+import { InvoiceData } from '@/types/invoice';
 
-# Health check endpoint for Vercel
-@app.route('/api/health', methods=['GET'])
-def health_check():
-    return jsonify({'status': 'healthy'}), 200
+const prisma = new PrismaClient();
+
+const SPOOL_WEIGHTS = {
+  "33lb": 33.0,
+  "44lb": 44.0,
+  "550lb": 550.0,
+} as const;
+
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse
+) {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  try {
+    const data = req.body as InvoiceData;
+
+    // Validate input
+    if (!data.clientEmail || !data.spoolType || !data.pricePerPound || !data.quantity) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    if (!SPOOL_WEIGHTS[data.spoolType]) {
+      return res.status(400).json({ error: 'Invalid spool type' });
+    }
+
+    // Get client info from HubSpot
+    const clientInfo = await getClientInfo(data.clientEmail);
+    if (!clientInfo) {
+      return res.status(404).json({ error: 'Client not found in HubSpot' });
+    }
+
+    // Calculate total price
+    const spoolWeight = SPOOL_WEIGHTS[data.spoolType];
+    const totalPrice = Number((data.pricePerPound * spoolWeight * data.quantity).toFixed(2));
+
+    // Create invoice
+    const invoice = await prisma.invoice.create({
+      data: {
+        clientEmail: clientInfo.email,
+        clientName: clientInfo.name,
+        spoolType: data.spoolType,
+        pricePerPound: data.pricePerPound,
+        spoolWeight,
+        quantity: data.quantity,
+        totalPrice,
+      },
+    });
+
+    // Send email
+    const emailSent = await sendInvoiceEmail(invoice);
+
+    return res.status(201).json({
+      message: 'Invoice created successfully',
+      invoice,
+      emailSent,
+    });
+
+  } catch (error) {
+    console.error('Error creating invoice:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+// pages/api/invoices/[id].ts
+import { NextApiRequest, NextApiResponse } from 'next';
+import { PrismaClient } from '@prisma/client';
+
+const prisma = new PrismaClient();
+
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse
+) {
+  if (req.method !== 'GET') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  const { id } = req.query;
+
+  try {
+    const invoice = await prisma.invoice.findUnique({
+      where: { id: String(id) },
+    });
+
+    if (!invoice) {
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+
+    return res.status(200).json(invoice);
+  } catch (error) {
+    console.error('Error fetching invoice:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+// pages/index.tsx
+import { useState } from 'react';
+import { useForm } from 'react-hook-form';
+import axios from 'axios';
+import { InvoiceData, Invoice } from '@/types/invoice';
+
+export default function Home() {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<Invoice | null>(null);
+  
+  const { register, handleSubmit, formState: { errors }, reset } = useForm<InvoiceData>();
+
+  const onSubmit = async (data: InvoiceData) => {
+    setLoading(true);
+    setError(null);
+    setSuccess(null);
+
+    try {
+      const response = await axios.post('/api/invoices', data);
+      setSuccess(response.data.invoice);
+      reset();
+    } catch (err) {
+      setError(err.response?.data?.error || 'An error occurred');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-gray-100 py-12 px-4 sm:px-6 lg:px-8">
+      <div className="max-w-md mx-auto bg-white rounded-lg shadow-md p-6">
+        <h1 className="text-2xl font-bold mb-6">Create Invoice</h1>
+        
+        <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700">
+              Client Email
+            </label>
+            <input
+              type="email"
+              {...register('clientEmail', { required: 'Email is required' })}
+              className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2"
+            />
+            {errors.clientEmail && (
+              <p className="text-red-500 text-sm">{errors.clientEmail.message}</p>
+            )}
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700">
+              Spool Type
+            </label>
+            <select
+              {...register('spoolType', { required: 'Spool type is required' })}
+              className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2"
+            >
+              <option value="">Select a spool type</option>
+              <option value="33lb">33lb</option>
+              <option value="44lb">44lb</option>
+              <option value="550lb">550lb</option>
+            </select>
+            {errors.spoolType && (
+              <p className="text-red-500 text-sm">{errors.spoolType.message}</p>
+            )}
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700">
+              Price per Pound ($)
+            </label>
+            <input
+              type="number"
+              step="0.01"
+              {...register('pricePerPound', { 
+                required: 'Price is required',
+                min: { value: 0.01, message: 'Price must be greater than 0' }
+              })}
+              className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2"
+            />
+            {errors.pricePerPound && (
+              <p className="text-red-500 text-sm">{errors.pricePerPound.message}</p>
+            )}
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700">
+              Quantity
+            </label>
+            <input
+              type="number"
+              {...register('quantity', { 
+                required: 'Quantity is required',
+                min: { value: 1, message: 'Quantity must be at least 1' }
+              })}
+              className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2"
+            />
+            {errors.quantity && (
+              <p className="text-red-500 text-sm">{errors.quantity.message}</p>
+            )}
+          </div>
+
+          <button
+            type="submit"
+            disabled={loading}
+            className="w-full bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 disabled:opacity-50"
+          >
+            {loading ? 'Creating Invoice...' : 'Create Invoice'}
+          </button>
+        </form>
+
+        {error && (
+          <div className="mt-4 p-3 bg-red-100 text-red-700 rounded-md">
+            {error}
+          </div>
+        )}
+
+        {success && (
+          <div className="mt-4 p-3 bg-green-100 text-green-700 rounded-md">
+            <h2 className="font-bold">Invoice Created Successfully</h2>
+            <p>Invoice ID: {success.id}</p>
+            <p>Total Amount: ${success.totalPrice.toFixed(2)}</p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
