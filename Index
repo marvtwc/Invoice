@@ -1,59 +1,6 @@
-// package.json
-{
-  "name": "nextjs-invoice-system",
-  "version": "0.1.0",
-  "private": true,
-  "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
-    "lint": "next lint",
-    "postinstall": "prisma generate"
-  },
-  "dependencies": {
-    "@prisma/client": "^5.0.0",
-    "@types/node": "^20.0.0",
-    "@types/react": "^18.0.0",
-    "@types/react-dom": "^18.0.0",
-    "axios": "^1.6.0",
-    "next": "13.5.0",
-    "react": "^18.2.0",
-    "react-dom": "^18.2.0",
-    "react-hook-form": "^7.0.0",
-    "typescript": "^5.0.0"
-  },
-  "devDependencies": {
-    "prisma": "^5.0.0",
-    "autoprefixer": "^10.0.0",
-    "postcss": "^8.0.0",
-    "tailwindcss": "^3.0.0"
-  }
-}
-
-// prisma/schema.prisma
-generator client {
-  provider = "prisma-client-js"
-}
-
-datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
-}
-
-model Invoice {
-  id            String   @id @default(cuid())
-  createdAt     DateTime @default(now())
-  clientEmail   String
-  clientName    String
-  spoolType     String
-  pricePerPound Float
-  spoolWeight   Float
-  quantity      Int
-  totalPrice    Float
-}
-
 // src/types/invoice.ts
 export interface InvoiceData {
+  clientName: string;
   clientEmail: string;
   spoolType: "33lb" | "44lb" | "550lb";
   pricePerPound: number;
@@ -63,107 +10,13 @@ export interface InvoiceData {
 export interface Invoice extends InvoiceData {
   id: string;
   createdAt: Date;
-  clientName: string;
   spoolWeight: number;
   totalPrice: number;
 }
 
-// src/lib/hubspot.ts
-import axios from 'axios';
-
-const HUBSPOT_API_URL = "https://api.hubapi.com/crm/v3/objects/contacts";
-
-export async function getClientInfo(email: string) {
-  try {
-    const response = await axios.post(
-      `${HUBSPOT_API_URL}/search`,
-      {
-        filterGroups: [{
-          filters: [{
-            propertyName: "email",
-            operator: "EQ",
-            value: email
-          }]
-        }]
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.HUBSPOT_API_KEY}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
-
-    const data = response.data;
-    if (data.total > 0) {
-      const properties = data.results[0].properties;
-      return {
-        email: properties.email,
-        name: `${properties.firstname || ''} ${properties.lastname || ''}`.trim()
-      };
-    }
-    return null;
-  } catch (error) {
-    console.error('HubSpot API error:', error);
-    return null;
-  }
-}
-
-// src/lib/email.ts
-import nodemailer from 'nodemailer';
-import { Invoice } from '@/types/invoice';
-
-export async function sendInvoiceEmail(invoice: Invoice) {
-  const transporter = nodemailer.createTransport({
-    host: 'smtp.gmail.com',
-    port: 587,
-    secure: false,
-    auth: {
-      user: process.env.SMTP_EMAIL,
-      pass: process.env.SMTP_PASSWORD,
-    },
-  });
-
-  const mailOptions = {
-    from: process.env.SMTP_EMAIL,
-    to: invoice.clientEmail,
-    subject: `Invoice #${invoice.id} for Welding Wire Spools`,
-    text: `
-Dear ${invoice.clientName},
-
-Here is your invoice details:
-
-Invoice Number: ${invoice.id}
-Spool Type: ${invoice.spoolType}
-Quantity: ${invoice.quantity}
-Price per Pound: $${invoice.pricePerPound.toFixed(2)}
-Total Weight: ${(invoice.spoolWeight * invoice.quantity).toFixed(2)} lbs
-Total Amount: $${invoice.totalPrice.toFixed(2)}
-
-Thank you for your business!
-
-Best regards,
-Your Company Name
-    `,
-  };
-
-  try {
-    await transporter.sendMail(mailOptions);
-    return true;
-  } catch (error) {
-    console.error('Email sending error:', error);
-    return false;
-  }
-}
-
 // pages/api/invoices/index.ts
 import { NextApiRequest, NextApiResponse } from 'next';
-import { PrismaClient } from '@prisma/client';
-import { getClientInfo } from '@/lib/hubspot';
-import { sendInvoiceEmail } from '@/lib/email';
 import { InvoiceData } from '@/types/invoice';
-
-const prisma = new PrismaClient();
 
 const SPOOL_WEIGHTS = {
   "33lb": 33.0,
@@ -171,69 +24,64 @@ const SPOOL_WEIGHTS = {
   "550lb": 550.0,
 } as const;
 
+// Simple in-memory storage (replace with database in production)
+let invoices: any[] = [];
+
 export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse
 ) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
-  }
+  if (req.method === 'POST') {
+    try {
+      const data = req.body as InvoiceData;
 
-  try {
-    const data = req.body as InvoiceData;
+      // Validate input
+      if (!data.clientEmail || !data.clientName || !data.spoolType || !data.pricePerPound || !data.quantity) {
+        return res.status(400).json({ error: 'Missing required fields' });
+      }
 
-    // Validate input
-    if (!data.clientEmail || !data.spoolType || !data.pricePerPound || !data.quantity) {
-      return res.status(400).json({ error: 'Missing required fields' });
-    }
+      if (!SPOOL_WEIGHTS[data.spoolType]) {
+        return res.status(400).json({ error: 'Invalid spool type' });
+      }
 
-    if (!SPOOL_WEIGHTS[data.spoolType]) {
-      return res.status(400).json({ error: 'Invalid spool type' });
-    }
+      // Calculate total price
+      const spoolWeight = SPOOL_WEIGHTS[data.spoolType];
+      const totalPrice = Number((data.pricePerPound * spoolWeight * data.quantity).toFixed(2));
 
-    // Get client info from HubSpot
-    const clientInfo = await getClientInfo(data.clientEmail);
-    if (!clientInfo) {
-      return res.status(404).json({ error: 'Client not found in HubSpot' });
-    }
-
-    // Calculate total price
-    const spoolWeight = SPOOL_WEIGHTS[data.spoolType];
-    const totalPrice = Number((data.pricePerPound * spoolWeight * data.quantity).toFixed(2));
-
-    // Create invoice
-    const invoice = await prisma.invoice.create({
-      data: {
-        clientEmail: clientInfo.email,
-        clientName: clientInfo.name,
+      // Create invoice
+      const invoice = {
+        id: Date.now().toString(),
+        createdAt: new Date(),
+        clientEmail: data.clientEmail,
+        clientName: data.clientName,
         spoolType: data.spoolType,
         pricePerPound: data.pricePerPound,
         spoolWeight,
         quantity: data.quantity,
         totalPrice,
-      },
-    });
+      };
 
-    // Send email
-    const emailSent = await sendInvoiceEmail(invoice);
+      // Store invoice in memory
+      invoices.push(invoice);
 
-    return res.status(201).json({
-      message: 'Invoice created successfully',
-      invoice,
-      emailSent,
-    });
+      return res.status(201).json({
+        message: 'Invoice created successfully',
+        invoice,
+      });
 
-  } catch (error) {
-    console.error('Error creating invoice:', error);
-    return res.status(500).json({ error: 'Internal server error' });
+    } catch (error) {
+      console.error('Error creating invoice:', error);
+      return res.status(500).json({ error: 'Internal server error' });
+    }
+  } else if (req.method === 'GET') {
+    return res.status(200).json(invoices);
   }
+
+  return res.status(405).json({ error: 'Method not allowed' });
 }
 
 // pages/api/invoices/[id].ts
 import { NextApiRequest, NextApiResponse } from 'next';
-import { PrismaClient } from '@prisma/client';
-
-const prisma = new PrismaClient();
 
 export default async function handler(
   req: NextApiRequest,
@@ -244,21 +92,13 @@ export default async function handler(
   }
 
   const { id } = req.query;
+  const invoice = invoices.find(inv => inv.id === id);
 
-  try {
-    const invoice = await prisma.invoice.findUnique({
-      where: { id: String(id) },
-    });
-
-    if (!invoice) {
-      return res.status(404).json({ error: 'Invoice not found' });
-    }
-
-    return res.status(200).json(invoice);
-  } catch (error) {
-    console.error('Error fetching invoice:', error);
-    return res.status(500).json({ error: 'Internal server error' });
+  if (!invoice) {
+    return res.status(404).json({ error: 'Invoice not found' });
   }
+
+  return res.status(200).json(invoice);
 }
 
 // pages/index.tsx
@@ -283,7 +123,7 @@ export default function Home() {
       const response = await axios.post('/api/invoices', data);
       setSuccess(response.data.invoice);
       reset();
-    } catch (err) {
+    } catch (err: any) {
       setError(err.response?.data?.error || 'An error occurred');
     } finally {
       setLoading(false);
@@ -296,6 +136,20 @@ export default function Home() {
         <h1 className="text-2xl font-bold mb-6">Create Invoice</h1>
         
         <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700">
+              Client Name
+            </label>
+            <input
+              type="text"
+              {...register('clientName', { required: 'Name is required' })}
+              className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2"
+            />
+            {errors.clientName && (
+              <p className="text-red-500 text-sm">{errors.clientName.message}</p>
+            )}
+          </div>
+
           <div>
             <label className="block text-sm font-medium text-gray-700">
               Client Email
